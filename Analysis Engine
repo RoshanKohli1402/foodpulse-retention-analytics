@@ -1,0 +1,292 @@
+"""
+FoodPulse — Customer Retention & Cohort Analytics
+==================================================
+End-to-end analysis pipeline for a food delivery platform.
+Covers: data generation, ETL, cohort analysis, RFM segmentation,
+retention curves, and business insight extraction.
+
+Author: Roshan Kohli
+Dataset: Synthetic food delivery data (50K orders, 5K customers, 2022–2024)
+Tools: Python · Pandas · NumPy · Scikit-learn · Matplotlib · Seaborn
+"""
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import seaborn as sns
+from datetime import datetime, timedelta
+import warnings
+warnings.filterwarnings('ignore')
+
+# ============================================================
+# 1. DATA GENERATION
+# ============================================================
+
+def generate_dataset(n_customers=5000, n_orders=50000, seed=42):
+    """
+    Generate a realistic synthetic food delivery dataset.
+    Simulates customer segments, order patterns, and city distributions
+    based on Indian metro food delivery market dynamics.
+    """
+    np.random.seed(seed)
+
+    cities = ['Mumbai', 'Delhi', 'Bangalore', 'Hyderabad', 'Pune', 'Chennai', 'Kolkata', 'Ahmedabad']
+    city_probs = [0.22, 0.20, 0.18, 0.12, 0.10, 0.08, 0.06, 0.04]
+    segments = ['Premium', 'Regular', 'Occasional', 'New']
+    seg_probs = [0.15, 0.45, 0.25, 0.15]
+    cuisines = ['North Indian', 'South Indian', 'Chinese', 'Pizza', 'Burger', 'Biryani', 'Desserts', 'Healthy']
+    avg_values = {'Premium': (650, 150), 'Regular': (380, 100), 'Occasional': (280, 80), 'New': (220, 60)}
+
+    # Customer master table
+    customer_ids = [f"C{i:05d}" for i in range(1, n_customers + 1)]
+    customers = pd.DataFrame({
+        'customer_id': customer_ids,
+        'city': np.random.choice(cities, n_customers, p=city_probs),
+        'acquisition_date': [datetime(2022, 1, 1) + timedelta(days=int(x))
+                             for x in np.random.randint(0, 700, n_customers)],
+        'segment': np.random.choice(segments, n_customers, p=seg_probs),
+        'age_group': np.random.choice(['18-24', '25-34', '35-44', '45+'], n_customers, p=[0.3, 0.4, 0.2, 0.1])
+    })
+
+    # Order fact table
+    records = []
+    seg_lookup = customers.set_index('customer_id')['segment'].to_dict()
+    city_lookup = customers.set_index('customer_id')['city'].to_dict()
+
+    sampled_customers = np.random.choice(customer_ids, n_orders)
+    for i, cust_id in enumerate(sampled_customers):
+        seg = seg_lookup[cust_id]
+        mu, sigma = avg_values[seg]
+        order_value = max(50, np.random.normal(mu, sigma))
+        order_date = datetime(2022, 1, 1) + timedelta(days=int(np.random.randint(0, 1095)))
+        records.append({
+            'order_id': f"O{i+1:06d}",
+            'customer_id': cust_id,
+            'order_date': order_date,
+            'order_value': round(order_value, 2),
+            'cuisine': np.random.choice(cuisines),
+            'platform': np.random.choice(['App', 'Web']),
+            'delivery_time_min': max(15, round(np.random.normal(32, 8), 1)),
+            'rating': round(max(1, min(5, np.random.normal(3.8, 0.7))), 1),
+            'city': city_lookup[cust_id],
+            'is_cancelled': int(np.random.random() < 0.08)
+        })
+
+    orders = pd.DataFrame(records)
+    orders['order_date'] = pd.to_datetime(orders['order_date'])
+    return customers, orders
+
+
+# ============================================================
+# 2. ETL PIPELINE
+# ============================================================
+
+def preprocess(orders):
+    """Clean orders and add derived time fields."""
+    df = orders[orders['is_cancelled'] == 0].copy()
+    df['order_date'] = pd.to_datetime(df['order_date'])
+    df['order_month'] = df['order_date'].dt.to_period('M')
+    df['order_year'] = df['order_date'].dt.year
+    df['order_quarter'] = df['order_date'].dt.to_period('Q')
+    df['order_date_only'] = df['order_date'].dt.normalize()
+    return df
+
+
+# ============================================================
+# 3. COHORT ANALYSIS
+# ============================================================
+
+def build_cohort_table(df):
+    """
+    Build a monthly cohort retention matrix.
+    - Cohort = month of customer's first order
+    - Retention = % of cohort still active in month N
+    """
+    first_order = df.groupby('customer_id')['order_date_only'].min().reset_index()
+    first_order.columns = ['customer_id', 'cohort_date']
+    first_order['cohort_month'] = first_order['cohort_date'].dt.to_period('M')
+
+    df = df.merge(first_order[['customer_id', 'cohort_month']], on='customer_id')
+    df['order_period'] = df['order_date_only'].dt.to_period('M')
+    df['cohort_index'] = (df['order_period'] - df['cohort_month']).apply(lambda x: x.n)
+
+    cohort_counts = df.groupby(['cohort_month', 'cohort_index'])['customer_id'].nunique()
+    cohort_pivot = cohort_counts.unstack(fill_value=0)
+    cohort_sizes = cohort_pivot[0]
+    retention = cohort_pivot.divide(cohort_sizes, axis=0).round(4) * 100
+
+    return retention, cohort_sizes
+
+
+def plot_cohort_heatmap(retention, title="Monthly Cohort Retention Heatmap"):
+    """Visualise retention matrix as a colour-coded heatmap."""
+    fig, ax = plt.subplots(figsize=(14, 8))
+    cmap = sns.color_palette("YlOrRd", as_cmap=True)
+    
+    subset = retention.iloc[:12, :13]
+    sns.heatmap(
+        subset, annot=True, fmt='.0f', cmap=cmap,
+        linewidths=0.5, ax=ax, cbar_kws={'label': 'Retention %'},
+        annot_kws={"size": 9}
+    )
+    ax.set_title(title, fontsize=14, fontweight='bold', pad=20)
+    ax.set_xlabel('Month Since First Order', fontsize=11)
+    ax.set_ylabel('Cohort (First Order Month)', fontsize=11)
+    ax.set_yticklabels([str(m) for m in subset.index], rotation=0)
+    plt.tight_layout()
+    plt.savefig('cohort_heatmap.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    print("✅ Saved: cohort_heatmap.png")
+
+
+# ============================================================
+# 4. RFM SEGMENTATION
+# ============================================================
+
+def build_rfm(df, snapshot_date=None):
+    """
+    Compute Recency, Frequency, Monetary scores.
+    - Recency: days since last order
+    - Frequency: total order count
+    - Monetary: total spend
+    Scoring: Quintile-based, 1–5 each axis.
+    """
+    if snapshot_date is None:
+        snapshot_date = df['order_date'].max() + timedelta(days=1)
+
+    rfm = df.groupby('customer_id').agg(
+        recency=('order_date', lambda x: (snapshot_date - x.max()).days),
+        frequency=('order_id', 'count'),
+        monetary=('order_value', 'sum')
+    ).reset_index()
+
+    rfm['R'] = pd.qcut(rfm['recency'], 5, labels=[5, 4, 3, 2, 1]).astype(int)
+    rfm['F'] = pd.qcut(rfm['frequency'].rank(method='first'), 5, labels=[1, 2, 3, 4, 5]).astype(int)
+    rfm['M'] = pd.qcut(rfm['monetary'], 5, labels=[1, 2, 3, 4, 5]).astype(int)
+    rfm['RFM_Score'] = rfm['R'] * 100 + rfm['F'] * 10 + rfm['M']
+
+    def assign_segment(row):
+        if row['R'] >= 4 and row['F'] >= 4:
+            return 'Champions'
+        elif row['R'] >= 3 and row['F'] >= 3:
+            return 'Loyal Customers'
+        elif row['R'] >= 4 and row['F'] <= 2:
+            return 'Recent Customers'
+        elif row['R'] <= 2 and row['F'] >= 3:
+            return 'At Risk'
+        elif row['R'] == 1 and row['F'] == 1:
+            return 'Lost'
+        elif row['F'] >= 4:
+            return 'Cant Lose Them'
+        else:
+            return 'Potential Loyalists'
+
+    rfm['segment'] = rfm.apply(assign_segment, axis=1)
+    return rfm
+
+
+def plot_rfm_segments(rfm):
+    """Bar chart of RFM segment distribution with avg monetary value overlay."""
+    summary = rfm.groupby('segment').agg(count=('customer_id', 'count'),
+                                          avg_ltv=('monetary', 'mean')).reset_index()
+    summary = summary.sort_values('count', ascending=False)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    colors = ['#ff4d00', '#ff8c42', '#ffd166', '#06d6a0', '#118ab2', '#9b5de5', '#ef476f']
+
+    ax1.bar(summary['segment'], summary['count'], color=colors[:len(summary)], edgecolor='white', linewidth=0.5)
+    ax1.set_title('Customer Distribution by RFM Segment', fontweight='bold')
+    ax1.set_xlabel('Segment')
+    ax1.set_ylabel('Customer Count')
+    ax1.tick_params(axis='x', rotation=30)
+
+    ax2.bar(summary['segment'], summary['avg_ltv'], color=colors[:len(summary)], edgecolor='white', linewidth=0.5)
+    ax2.set_title('Avg Lifetime Value by RFM Segment (₹)', fontweight='bold')
+    ax2.set_xlabel('Segment')
+    ax2.set_ylabel('Avg Monetary (₹)')
+    ax2.tick_params(axis='x', rotation=30)
+
+    plt.tight_layout()
+    plt.savefig('rfm_segments.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    print("✅ Saved: rfm_segments.png")
+
+
+# ============================================================
+# 5. BUSINESS INSIGHTS
+# ============================================================
+
+def generate_insights(df, rfm, retention):
+    """Extract and print key business insights."""
+    print("\n" + "="*60)
+    print("  FOODPULSE — KEY BUSINESS INSIGHTS")
+    print("="*60)
+
+    # Revenue summary
+    total_rev = df['order_value'].sum()
+    total_orders = len(df)
+    aov = total_rev / total_orders
+    print(f"\n📦 Total Orders (excl. cancelled): {total_orders:,}")
+    print(f"💰 Total Revenue: ₹{total_rev:,.0f}")
+    print(f"🧾 Average Order Value: ₹{aov:.1f}")
+
+    # Champion revenue share
+    champion_rev = rfm[rfm['segment'] == 'Champions']['monetary'].sum()
+    print(f"\n🏆 Champions Revenue Share: {champion_rev/rfm['monetary'].sum()*100:.1f}%")
+    print(f"   (Champions = {len(rfm[rfm['segment']=='Champions'])} customers, "
+          f"{len(rfm[rfm['segment']=='Champions'])/len(rfm)*100:.1f}% of base)")
+
+    # At-risk revenue at stake
+    at_risk = rfm[rfm['segment'] == 'At Risk']
+    print(f"\n⚠️  At-Risk Customers: {len(at_risk):,}")
+    print(f"   Revenue at stake: ₹{at_risk['monetary'].sum():,.0f}")
+    print(f"   Avg recency: {at_risk['recency'].mean():.0f} days since last order")
+
+    # Month-1 retention
+    m1_avg = retention[1].mean()
+    print(f"\n📉 Avg Month-1 Retention: {m1_avg:.1f}%")
+    print(f"   (Critical churn window — target with D+3 push notification)")
+
+    # Top city
+    top_city = df.groupby('city')['order_value'].sum().idxmax()
+    top_city_rev = df.groupby('city')['order_value'].sum().max()
+    print(f"\n🏙️  Top Revenue City: {top_city} (₹{top_city_rev:,.0f})")
+
+    # Top cuisine
+    top_cuisine = df.groupby('cuisine')['order_id'].count().idxmax()
+    print(f"🍛 Most Ordered Cuisine: {top_cuisine}")
+
+    print("\n" + "="*60)
+
+
+# ============================================================
+# 6. MAIN EXECUTION
+# ============================================================
+
+if __name__ == "__main__":
+    print("🚀 Generating synthetic food delivery dataset...")
+    customers, orders = generate_dataset()
+    print(f"   ✅ {len(customers):,} customers | {len(orders):,} orders generated")
+
+    print("\n🔧 Running ETL pipeline...")
+    df = preprocess(orders)
+    print(f"   ✅ {len(df):,} valid orders after cancellation filter")
+
+    print("\n📊 Building cohort retention matrix...")
+    retention, cohort_sizes = build_cohort_table(df)
+    print(f"   ✅ {len(retention)} cohorts × {len(retention.columns)} months")
+
+    print("\n🎯 Running RFM segmentation...")
+    rfm = build_rfm(df)
+    print("   ✅ Segment distribution:")
+    for seg, count in rfm['segment'].value_counts().items():
+        print(f"      {seg}: {count}")
+
+    print("\n📈 Generating visualisations...")
+    plot_cohort_heatmap(retention)
+    plot_rfm_segments(rfm)
+
+    generate_insights(df, rfm, retention)
+
+    print("\n✅ All done! Open zomato_analytics_dashboard.html for the interactive dashboard.")
